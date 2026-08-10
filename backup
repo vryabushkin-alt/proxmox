@@ -1,9 +1,9 @@
-cat << 'EOF' > /usr/local/bin/backup 
+cat << 'EOF' > /usr/local/bin/backup
 #!/usr/bin/env python3
 import os, sys, re, glob, subprocess
 from datetime import datetime
 
-# --- 1. Допоміжні функції ---
+# --- 1. Вспомогательные функции ---
 
 def get_all_vms():
     vms = {}
@@ -107,7 +107,7 @@ def parse_backups():
     no_backup_vms.sort(key=lambda x: int(x["vmid"]))
     return backups, no_backup_vms
 
-# --- 2. Операції ---
+# --- 2. Операции ---
 
 def show_list():
     backups, no_backups = parse_backups()
@@ -184,9 +184,11 @@ def create_backups(inputs_to_backup):
     for item in inputs_to_backup:
         try:
             val_int = int(item)
+            # Проверяем, передан ли ID из таблицы бэкапов
             if val_int in b_map:
                 vmid = b_map[val_int]
                 valid_vmids.append(vmid)
+            # Если не ID, то проверяем, существует ли машина с таким VMID
             elif str(val_int) in all_vms:
                 valid_vmids.append(str(val_int))
             else:
@@ -198,8 +200,10 @@ def create_backups(inputs_to_backup):
         print("Нет корректных VMID для бэкапа.")
         return
 
+    # Удаляем дубликаты с сохранением порядка
     valid_vmids = list(dict.fromkeys(valid_vmids))
 
+    # Выбор режима
     print("\nВыберите режим бэкапа (Mode):")
     print("  1) snapshot  (Рекомендуется: без остановки ВМ на лету)")
     print("  2) suspend   (С временной заморозкой работы)")
@@ -209,6 +213,7 @@ def create_backups(inputs_to_backup):
     mode_map = {"1": "snapshot", "2": "suspend", "3": "stop", "": "snapshot"}
     selected_mode = mode_map.get(mode_choice, "snapshot")
 
+    # Выбор хранилища
     storages = get_backup_storages()
     if not storages:
         print("Ошибка: В Proxmox не найдено активных хранилищ с типом 'backup'.")
@@ -246,7 +251,7 @@ def create_backups(inputs_to_backup):
         else:
             print(f"\n Ошибка при создании бэкапа для VM {vmid}.")
 
-# --- 3. Точка входу ---
+# --- 3. Точка входа ---
 
 def main():
     if len(sys.argv) == 1:
@@ -276,5 +281,4 @@ if __name__ == "__main__":
     main()
 EOF
 
-
-chmod +x /usr/local/bin/backup 
+chmod +x /usr/local/bin/backup
