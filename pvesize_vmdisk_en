@@ -1,0 +1,102 @@
+# 1. Install pvesize script (RAM + Storage)
+cat << 'EOF' > /usr/local/bin/pvesize
+#!/usr/bin/env python3
+import subprocess
+
+# --- 1. RAM and Swap ---
+try:
+    with open('/proc/meminfo', 'r') as f:
+        meminfo = {}
+        for line in f:
+            parts = line.split()
+            meminfo[parts[0].rstrip(':')] = int(parts[1])
+
+    ram_total = meminfo.get('MemTotal', 0) / 1024 / 1024
+    ram_avail = meminfo.get('MemAvailable', 0) / 1024 / 1024
+    ram_used = ram_total - ram_avail
+    ram_pct = (ram_used / ram_total * 100) if ram_total > 0 else 0
+
+    swap_total = meminfo.get('SwapTotal', 0) / 1024 / 1024
+    swap_free = meminfo.get('SwapFree', 0) / 1024 / 1024
+    swap_used = swap_total - swap_free
+    swap_pct = (swap_used / swap_total * 100) if swap_total > 0 else 0
+
+    print(f"{'MEMORY':<18} {'TYPE':<12} {'TOTAL':>9} {'USED':>9} {'FREE':>9} {'USED %':>9}")
+    print("-" * 72)
+    print(f"{'RAM':<18} {'system':<12} {ram_total:>8.1f}G {ram_used:>8.1f}G {ram_avail:>8.1f}G {ram_pct:>8.1f}%")
+    if swap_total > 0:
+        print(f"{'Swap':<18} {'system':<12} {swap_total:>8.1f}G {swap_used:>8.1f}G {swap_free:>8.1f}G {swap_pct:>8.1f}%")
+    print("\n")
+except Exception as e:
+    print(f"Error fetching memory data: {e}\n")
+
+# --- 2. Proxmox Storage ---
+res = subprocess.run(["pvesm", "status"], capture_output=True, text=True)
+if res.returncode != 0:
+    print("Error fetching storage status")
+    exit(1)
+
+lines = res.stdout.strip().split("\n")
+if len(lines) >= 2:
+    print(f"{'STORAGE':<18} {'TYPE':<12} {'TOTAL':>9} {'USED':>9} {'FREE':>9} {'USED %':>9}")
+    print("-" * 72)
+
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        name = parts[0]
+        stype = parts[1]
+        status = parts[2]
+        
+        if status != "active":
+            print(f"{name:<18} {stype:<12} {'[INACTIVE]':>38}")
+            continue
+
+        total_kb = float(parts[3])
+        used_kb = float(parts[4])
+        free_kb = float(parts[5])
+        pct = float(parts[6].replace("%", "")) if parts[6] != "N/A" else 0.0
+
+        total_gb = total_kb / 1024 / 1024
+        used_gb = used_kb / 1024 / 1024
+        free_gb = free_kb / 1024 / 1024
+
+        print(f"{name:<18} {stype:<12} {total_gb:>8.1f}G {used_gb:>8.1f}G {free_gb:>8.1f}G {pct:>8.1f}%")
+EOF
+
+# 2. Install vmdisk script (Virtual Machine Disks)
+cat << 'EOF' > /usr/local/bin/vmdisk
+#!/usr/bin/env python3
+import sys, json, subprocess
+
+def check_vm(vmid):
+    try:
+        res = subprocess.run(["qm", "guest", "cmd", str(vmid), "get-fsinfo"], capture_output=True, text=True)
+        if res.returncode != 0:
+            return
+        data = json.loads(res.stdout)
+        print(f"\n=== VM {vmid} ===")
+        for fs in data:
+            mp = fs.get("mountpoint")
+            t = fs.get("total-bytes")
+            u = fs.get("used-bytes")
+            if mp and t is not None and u is not None:
+                total = t / 1073741824
+                used = u / 1073741824
+                free = (t - u) / 1073741824
+                print(f"  Disk: {mp:<10} | Total: {total:>6.1f} GB | Used: {used:>6.1f} GB | Free: {free:>6.1f} GB")
+    except Exception:
+        pass
+
+if len(sys.argv) > 1:
+    check_vm(sys.argv[1])
+else:
+    out = subprocess.run("qm list | awk '$3==\"running\" {print $1}'", shell=True, capture_output=True, text=True)
+    for vmid in out.stdout.split():
+        check_vm(vmid)
+EOF
+
+# 3. Make files executable
+chmod +x /usr/local/bin/pvesize
+chmod +x /usr/local/bin/vmdisk
