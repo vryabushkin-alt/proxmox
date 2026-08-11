@@ -1,0 +1,50 @@
+cat << 'EOF' > /usr/local/bin/pmtls
+#!/usr/bin/env bash
+
+show_menu() {
+    clear
+    echo "=================================================="
+    echo "                 PVE Tools Menu                   "
+    echo "=================================================="
+    echo "1) Virtual Machine State Control (pve)"
+    echo "2) Backup Management (backup)"
+    echo "3) Host Storage & RAM Monitoring (pvesize)"
+    echo "4) VM Disk Usage Analysis (vmdisk)"
+    echo "0) Exit"
+    echo "=================================================="
+}
+
+while true; do
+    show_menu
+    read -rp "Select an option [0-4]: " choice
+    echo ""
+    case "$choice" in
+        1)
+            /usr/local/bin/pve
+            read -rp "Press Enter to return to menu..."
+            ;;
+        2)
+            /usr/local/bin/backup
+            read -rp "Press Enter to return to menu..."
+            ;;
+        3)
+            /usr/local/bin/pvesize
+            read -rp "Press Enter to return to menu..."
+            ;;
+        4)
+            /usr/local/bin/vmdisk
+            read -rp "Press Enter to return to menu..."
+            ;;
+        0)
+            echo "Exiting."
+            exit 0
+            ;;
+        *)
+            echo "Error: Invalid option selected."
+            sleep 1
+            ;;
+    esac
+done
+EOF
+
+chmod +x /usr/local/bin/pmtls
