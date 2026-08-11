@@ -1,0 +1,818 @@
+cat << 'EOF' > /usr/local/bin/backup
+#!/usr/bin/env bash
+
+# Color definitions
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+GRAY='\033[1;30m'
+NC='\033[0m' # No Color
+
+# Check for root privileges
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}Error: This script must be executed as root.${NC}"
+   exit 1
+fi
+
+# Global data containers
+declare -gA ALL_VMS_NAME
+declare -gA ALL_VMS_TYPE
+declare -gA ALL_VMS_STATUS
+
+BACKUP_FILES=()
+BACKUP_VMIDS=()
+BACKUP_TYPES=()
+BACKUP_DATES=()
+BACKUP_SIZES=()
+BACKUP_PATHS=()
+BACKUP_AGES=()
+BACKUP_NOTES=()
+
+NO_BACKUP_VMIDS=()
+
+# Fetch all QEMU VMs and LXC Containers in a single pass
+get_all_vms() {
+    ALL_VMS_NAME=()
+    ALL_VMS_TYPE=()
+    ALL_VMS_STATUS=()
+
+    # QEMU VMs
+    while read -r vmid name status rest; do
+        [[ -z "$vmid" || "$vmid" == "VMID" ]] && continue
+        ALL_VMS_NAME["$vmid"]="$name"
+        ALL_VMS_TYPE["$vmid"]="QEMU"
+        ALL_VMS_STATUS["$vmid"]="$status"
+    done < <(qm list 2>/dev/null)
+
+    # LXC Containers
+    while read -r vmid status name rest; do
+        [[ -z "$vmid" || "$vmid" == "VMID" ]] && continue
+        ALL_VMS_NAME["$vmid"]="$name"
+        ALL_VMS_TYPE["$vmid"]="LXC"
+        ALL_VMS_STATUS["$vmid"]="$status"
+    done < <(pct list 2>/dev/null)
+}
+
+# Fast human-readable file size formatter
+format_size() {
+    local bytes=$1
+    if command -v numfmt &>/dev/null; then
+        numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || echo "${bytes} B"
+    else
+        if (( bytes >= 1073741824 )); then
+            printf "%.1f GB" "$(awk -v b="$bytes" 'BEGIN {print b/1073741824}')"
+        elif (( bytes >= 1048576 )); then
+            printf "%.1f MB" "$(awk -v b="$bytes" 'BEGIN {print b/1048576}')"
+        else
+            printf "%.1f KB" "$(awk -v b="$bytes" 'BEGIN {print b/1024}')"
+        fi
+    fi
+}
+
+# Get list of valid storage directories for backups
+get_backup_dirs() {
+    local dirs=()
+
+    # Query Proxmox storage configuration for active backup stores
+    while read -r st; do
+        [[ -z "$st" ]] && continue
+        local path
+        path=$(pvesm path "${st}:backup" 2>/dev/null)
+        if [[ -n "$path" && -d "$path" ]]; then
+            dirs+=("$path")
+        fi
+    done < <(pvesm status -content backup 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
+
+    # Default directory fallbacks
+    dirs+=("/var/lib/vz/dump" "/mnt/backups/dump")
+
+    # Return unique existing directories
+    printf "%s\n" "${dirs[@]}" | sort -u | while read -r d; do
+        [[ -d "$d" ]] && echo "$d"
+    done
+}
+
+# Scan backup archives efficiently
+scan_backups() {
+    get_all_vms
+
+    BACKUP_FILES=()
+    BACKUP_VMIDS=()
+    BACKUP_TYPES=()
+    BACKUP_DATES=()
+    BACKUP_SIZES=()
+    BACKUP_PATHS=()
+    BACKUP_AGES=()
+    BACKUP_NOTES=()
+    NO_BACKUP_VMIDS=()
+
+    local raw_files=()
+    local backup_dirs=()
+    readarray -t backup_dirs < <(get_backup_dirs)
+
+    if [ ${#backup_dirs[@]} -eq 0 ]; then
+        return
+    fi
+
+    # Find strictly valid backup archives
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && raw_files+=("$line")
+    done < <(find "${backup_dirs[@]}" -maxdepth 1 -type f \
+        \( -name "vzdump-*.vma*" -o -name "vzdump-*.tar*" -o -name "vzdump-*.tgz*" \) \
+        ! -name "*.log" ! -name "*.notes" ! -name "*.tmp" 2>/dev/null)
+
+    # Group by VMID (ASC) and sort by Timestamp (DESC)
+    local sorted_records=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && sorted_records+=("$line")
+    done < <(
+        for file in "${raw_files[@]}"; do
+            local filename
+            filename=$(basename "$file")
+            if [[ "$filename" =~ ^vzdump-(qemu|lxc)-([0-9]+)-([0-9]{4})_([0-9]{2})_([0-9]{2})-([0-9]{2})_([0-9]{2})_([0-9]{2})\. ]]; then
+                local vmid="${BASH_REMATCH[2]}"
+                local dt_key="${BASH_REMATCH[3]}${BASH_REMATCH[4]}${BASH_REMATCH[5]}${BASH_REMATCH[6]}${BASH_REMATCH[7]}${BASH_REMATCH[8]}"
+                echo "$vmid $dt_key $file"
+            fi
+        done | sort -k1,1n -k2,2r
+    )
+
+    local backed_up_ids=()
+    local current_time
+    current_time=$(date +%s)
+
+    for record in "${sorted_records[@]}"; do
+        local file
+        file=$(echo "$record" | cut -d' ' -f3-)
+        local filename
+        filename=$(basename "$file")
+
+        if [[ "$filename" =~ ^vzdump-(qemu|lxc)-([0-9]+)-([0-9]{4})_([0-9]{2})_([0-9]{2})-([0-9]{2})_([0-9]{2})_([0-9]{2})\. ]]; then
+            local vm_type="${BASH_REMATCH[1]^^}"
+            local vmid="${BASH_REMATCH[2]}"
+            local dt_str="${BASH_REMATCH[5]}.${BASH_REMATCH[4]}.${BASH_REMATCH[3]} ${BASH_REMATCH[6]}:${BASH_REMATCH[7]}:${BASH_REMATCH[8]}"
+
+            local file_info
+            file_info=$(stat -c "%s %Y" "$file" 2>/dev/null)
+            local size_bytes
+            size_bytes=$(echo "$file_info" | awk '{print $1}')
+            local mtime
+            mtime=$(echo "$file_info" | awk '{print $2}')
+
+            [[ -z "$size_bytes" ]] && continue
+
+            local size_str
+            size_str=$(format_size "$size_bytes")
+            local age_seconds=$(( current_time - mtime ))
+
+            # Read backup notes if sidecar .notes file exists
+            local note_text="-"
+            if [[ -f "${file}.notes" ]]; then
+                note_text=$(tr -d '\r\n' < "${file}.notes" | xargs 2>/dev/null)
+                [[ -z "$note_text" ]] && note_text="-"
+            fi
+
+            BACKUP_FILES+=("$filename")
+            BACKUP_VMIDS+=("$vmid")
+            BACKUP_TYPES+=("$vm_type")
+            BACKUP_DATES+=("$dt_str")
+            BACKUP_SIZES+=("$size_str")
+            BACKUP_PATHS+=("$file")
+            BACKUP_AGES+=("$age_seconds")
+            BACKUP_NOTES+=("$note_text")
+
+            backed_up_ids+=("$vmid")
+        fi
+    done
+
+    # Identify VMs without backups
+    for id in "${!ALL_VMS_NAME[@]}"; do
+        if [[ ! " ${backed_up_ids[*]} " =~ " ${id} " ]]; then
+            NO_BACKUP_VMIDS+=("$id")
+        fi
+    done
+}
+
+# Helper: Select Mode & Storage
+select_mode_and_storage() {
+    echo -e "\nSelect mode:"
+    echo "  1) snapshot  (Recommended: live backup without downtime)"
+    echo "  2) suspend   (Temporary freeze)"
+    echo "  3) stop      (Full VM shutdown)"
+    read -p "Select mode [1-3] (default 1): " mode_choice
+
+    case "$mode_choice" in
+        2) SELECTED_MODE="suspend" ;;
+        3) SELECTED_MODE="stop" ;;
+        *) SELECTED_MODE="snapshot" ;;
+    esac
+
+    # Query active backup storages
+    local storages=()
+    while read -r st; do
+        [[ -z "$st" ]] && continue
+        storages+=("$st")
+    done < <(pvesm status -content backup 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
+
+    if [ ${#storages[@]} -eq 0 ]; then
+        echo -e "${RED}Error: No active backup storage found.${NC}"
+        return 1
+    fi
+
+    SELECTED_STORAGE="${storages[0]}"
+    if [ ${#storages[@]} -gt 1 ]; then
+        echo -e "\nAvailable storages:"
+        for idx in "${!storages[@]}"; do
+            echo "  $((idx+1))) ${storages[$idx]}"
+        done
+        read -p "Select storage [1-${#storages[@]}] (default 1): " st_choice
+        if [[ "$st_choice" =~ ^[0-9]+$ ]] && [ "$st_choice" -ge 1 ] && [ "$st_choice" -le "${#storages[@]}" ]; then
+            SELECTED_STORAGE="${storages[$((st_choice-1))]}"
+        fi
+    fi
+    return 0
+}
+
+# Display main UI dashboard
+show_menu() {
+    clear
+    scan_backups
+
+    echo -e "====================================================================================================================="
+    echo -e "                                         ${CYAN}Proxmox VE Backup Manager${NC}                                         "
+    echo -e "====================================================================================================================="
+    printf "%-4s | %-4s | %-6s | %-20s | %-19s | %-8s | %-25s\n" "#" "VMID" "Type" "VM Name" "Date & Time" "Size" "Note"
+    echo -e "---------------------------------------------------------------------------------------------------------------------"
+
+    local total_backups=${#BACKUP_FILES[@]}
+
+    # Age thresholds in seconds
+    local ONE_WEEK=604800      # 7 days
+    local ONE_MONTH=2592000    # 30 days
+
+    if [ "$total_backups" -eq 0 ]; then
+        echo -e "${YELLOW}No backup files found.${NC}"
+    else
+        local prev_vmid=""
+        for ((i=0; i<total_backups; i++)); do
+            idx=$((i+1))
+            vmid="${BACKUP_VMIDS[$i]}"
+            vm_type="${BACKUP_TYPES[$i]}"
+            vm_name="${ALL_VMS_NAME[$vmid]:-Removed}"
+            dt="${BACKUP_DATES[$i]}"
+            size="${BACKUP_SIZES[$i]}"
+            age="${BACKUP_AGES[$i]}"
+            note="${BACKUP_NOTES[$i]}"
+
+            if [ -n "$prev_vmid" ] && [ "$vmid" != "$prev_vmid" ]; then
+                echo -e "     ${GRAY}┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄${NC}"
+            fi
+            prev_vmid="$vmid"
+
+            local color=$GREEN
+            if [ "$age" -gt "$ONE_MONTH" ]; then
+                color=$RED
+            elif [ "$age" -gt "$ONE_WEEK" ]; then
+                color=$YELLOW
+            fi
+
+            printf "${color}%-4s | %-4s | %-6s | %-20s | %-19s | %-8s | %-25s${NC}\n" \
+                "$idx" "$vmid" "$vm_type" "${vm_name:0:20}" "$dt" "$size" "${note:0:25}"
+        done
+    fi
+
+    echo -e "\n====================================================================================================================="
+    echo -e "                                            ${YELLOW}VMs & CONTAINERS WITHOUT BACKUP${NC}                                          "
+    echo -e "====================================================================================================================="
+    printf "%-4s | %-6s | %-22s | %-12s | %-15s\n" "VMID" "Type" "VM Name" "Status" "Backup State"
+    echo -e "---------------------------------------------------------------------------------------------------------------------"
+
+    if [ ${#NO_BACKUP_VMIDS[@]} -eq 0 ]; then
+        echo -e "${GREEN}All virtual machines and containers have at least one backup!${NC}"
+    else
+        for id in $(printf "%s\n" "${NO_BACKUP_VMIDS[@]}" | sort -n); do
+            name="${ALL_VMS_NAME[$id]}"
+            type="${ALL_VMS_TYPE[$id]}"
+            status="${ALL_VMS_STATUS[$id]}"
+
+            local status_color=$RED
+            local status_text="STOPPED"
+            if [ "$status" == "running" ]; then
+                status_color=$GREEN
+                status_text="RUNNING"
+            fi
+
+            printf "%-4s | %-6s | %-22s | ${status_color}%-12s${NC} | ${RED}%-15s${NC}\n" \
+                "$id" "$type" "${name:0:22}" "$status_text" "NONE"
+        done
+    fi
+
+    echo -e "---------------------------------------------------------------------------------------------------------------------"
+    echo "Select an action:"
+    echo "  1) Create single backup (with note)"
+    echo "  2) Create batch backup (no note)"
+    echo -e "  3) ${YELLOW}Delete backup (by # index strictly)${NC}"
+    echo "  4) Refresh list"
+    echo "  0) Exit"
+    echo -e "====================================================================================================================="
+}
+
+# Action 1: Create single backup with comment
+execute_create_single() {
+    read -p "Enter item number (# from table) or VMID: " input
+
+    if [ -z "$input" ]; then
+        echo "Cancelled."
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    local target_vmid=""
+
+    if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le "${#BACKUP_FILES[@]}" ]; then
+        idx=$((input-1))
+        target_vmid="${BACKUP_VMIDS[$idx]}"
+    elif [[ -n "${ALL_VMS_NAME[$input]}" ]]; then
+        target_vmid="$input"
+    else
+        echo -e "${RED}Error: '#$input' or VMID not found in system.${NC}"
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    echo -e "\nSelected VM: ${GREEN}VMID $target_vmid (${ALL_VMS_NAME[$target_vmid]})${NC}"
+
+    read -p "Enter backup note/description (optional): " backup_note
+
+    select_mode_and_storage || { read -p "Press Enter to continue..."; return; }
+
+    echo -e "\nParameters: Mode = [${GREEN}$SELECTED_MODE${NC}], Storage = [${GREEN}$SELECTED_STORAGE${NC}], Note = [${CYAN}${backup_note:-none}${NC}]"
+    read -p "Press [Enter] to start backup (or type any text to cancel): " confirm
+    if [[ -n "$confirm" ]]; then
+        echo "Cancelled."
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    echo -e "\n========================================================"
+    echo -e "Starting backup: VMID $target_vmid (${ALL_VMS_NAME[$target_vmid]})"
+    echo -e "========================================================\n"
+
+    if [[ -n "$backup_note" ]]; then
+        vzdump "$target_vmid" --mode "$SELECTED_MODE" --storage "$SELECTED_STORAGE" --compress zstd --notes-template "$backup_note"
+    else
+        vzdump "$target_vmid" --mode "$SELECTED_MODE" --storage "$SELECTED_STORAGE" --compress zstd
+    fi
+
+    read -p "Completed. Press Enter to return to menu..."
+}
+
+# Action 2: Create batch backup without comment
+execute_create_batch() {
+    read -p "Enter item numbers (#), VMIDs (space-separated), or 000 (for all without backup): " input
+
+    if [ -z "$input" ]; then
+        echo "Cancelled."
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    local target_vmids=()
+
+    for item in $input; do
+        if [ "$item" == "000" ]; then
+            target_vmids+=("${NO_BACKUP_VMIDS[@]}")
+        elif [[ "$item" =~ ^[0-9]+$ ]] && [ "$item" -ge 1 ] && [ "$item" -le "${#BACKUP_FILES[@]}" ]; then
+            idx=$((item-1))
+            target_vmids+=("${BACKUP_VMIDS[$idx]}")
+        elif [[ -n "${ALL_VMS_NAME[$item]}" ]]; then
+            target_vmids+=("$item")
+        else
+            echo -e "${YELLOW}Warning: '#$item' or VMID '$item' not found, skipping.${NC}"
+        fi
+    done
+
+    readarray -t target_vmids < <(printf "%s\n" "${target_vmids[@]}" | sort -u)
+
+    if [ ${#target_vmids[@]} -eq 0 ]; then
+        echo -e "${RED}No valid VMs selected.${NC}"
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    echo -e "\nSelected VMs for backup:"
+    for id in "${target_vmids[@]}"; do
+        echo " - VMID $id (${ALL_VMS_NAME[$id]})"
+    done
+
+    select_mode_and_storage || { read -p "Press Enter to continue..."; return; }
+
+    echo -e "\nParameters: Mode = [${GREEN}$SELECTED_MODE${NC}], Storage = [${GREEN}$SELECTED_STORAGE${NC}]"
+    read -p "Press [Enter] to start backup process (or type any text to cancel): " confirm
+    if [[ -n "$confirm" ]]; then
+        echo "Cancelled."
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    for id in "${target_vmids[@]}"; do
+        echo -e "\n========================================================"
+        echo -e "Starting backup: VMID $id (${ALL_VMS_NAME[$id]})"
+        echo -e "========================================================\n"
+
+        vzdump "$id" --mode "$SELECTED_MODE" --storage "$SELECTED_STORAGE" --compress zstd
+    done
+
+    read -p "Completed. Press Enter to return to menu..."
+}
+
+# Action 3: Delete backup routine (strictly by row # from table)
+execute_delete() {
+    read -p "Enter item number(s) (# from table) to delete (space-separated): " input
+
+    if [ -z "$input" ]; then
+        echo "Cancelled."
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    local raw_files=()
+
+    for item in $input; do
+        if [[ "$item" =~ ^[0-9]+$ ]] && [ "$item" -ge 1 ] && [ "$item" -le "${#BACKUP_FILES[@]}" ]; then
+            local idx=$((item-1))
+            raw_files+=("${BACKUP_PATHS[$idx]}")
+        else
+            echo -e "${YELLOW}Warning: Item '#$item' is invalid or out of table range, skipping.${NC}"
+        fi
+    done
+
+    if [ ${#raw_files[@]} -eq 0 ]; then
+        echo -e "${RED}No valid backup numbers selected for deletion.${NC}"
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    local files_to_delete=()
+    readarray -t files_to_delete < <(printf "%s\n" "${raw_files[@]}" | sort -u)
+
+    echo -e "\n${RED}The following specific backup archive(s) will be PERMANENTLY deleted:${NC}"
+    for f in "${files_to_delete[@]}"; do
+        echo " - $f"
+    done
+
+    read -p "Are you sure you want to PERMANENTLY delete these backup file(s)? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Deletion cancelled."
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    for f in "${files_to_delete[@]}"; do
+        [[ -z "$f" ]] && continue
+        local base_path="${f%.vma*}"
+        base_path="${base_path%.tar*}"
+        base_path="${base_path%.tgz*}"
+
+        if [[ -n "$base_path" ]]; then
+            echo -e "\nRemoving files matching ${base_path}* ..."
+            rm -fv ${base_path}*
+        fi
+    done
+
+    read -p "Finished. Press Enter to return to menu..."
+}
+
+# Main application loop
+while true; do
+    show_menu
+    read -p "Select choice [0-4]: " choice
+    case $choice in
+        1) execute_create_single ;;
+        2) execute_create_batch ;;
+        3) execute_delete ;;
+        4) continue ;;
+        0) clear; exit 0 ;;
+        *) echo "Invalid option!"; sleep 1 ;;
+    esac
+done
+EOF
+
+cat << 'EOF' > /usr/local/bin/pve
+#!/usr/bin/env bash
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}Error: This script must be run as root.${NC}"
+   exit 1
+fi
+
+get_vms() {
+    RAW_VMS=()
+    while read -r vmid name status rest; do
+        [[ -z "$vmid" ]] && continue
+        
+        # Fast config check directly without calling `qm config`
+        conf_file="/etc/pve/qemu-server/${vmid}.conf"
+        if [[ -f "$conf_file" ]] && grep -q "^template: 1" "$conf_file"; then
+            continue
+        fi
+        
+        RAW_VMS+=("$vmid|$name|$status")
+    done < <(qm list | tail -n +2)
+}
+
+show_menu() {
+    clear
+    get_vms
+
+    if [ ${#RAW_VMS[@]} -eq 0 ]; then
+        echo "No virtual machines found."
+        exit 0
+    fi
+
+    echo "==================================================="
+    echo "              Proxmox VE VM Manager                "
+    echo "==================================================="
+    printf "%-4s | %-22s | %-6s | %-10s\n" "#" "Name" "VMID" "Status"
+    echo "---------------------------------------------------"
+
+    VM_INDEX=1
+    declare -gA VM_MAP_INDEX_TO_ID
+    declare -gA VM_MAP_ID_TO_NAME
+    declare -gA VM_MAP_ID_TO_STATUS
+
+    for line in "${RAW_VMS[@]}"; do
+        vmid=$(echo "$line" | cut -d'|' -f1)
+        name=$(echo "$line" | cut -d'|' -f2)
+        status=$(echo "$line" | cut -d'|' -f3)
+
+        VM_MAP_INDEX_TO_ID[$VM_INDEX]=$vmid
+        VM_MAP_ID_TO_NAME[$vmid]=$name
+        VM_MAP_ID_TO_STATUS[$vmid]=$status
+
+        if [ "$status" == "running" ]; then
+            status_colored="${GREEN}RUNNING${NC}"
+        else
+            status_colored="${RED}STOPPED${NC}"
+        fi
+
+        printf "%-4s | %-22s | %-6s | %b\n" "$VM_INDEX" "$name" "$vmid" "$status_colored"
+        ((VM_INDEX++))
+    done
+
+    echo "---------------------------------------------------"
+    echo "Select an action:"
+    echo "  1) Start"
+    echo "  2) Shutdown (Force Stop 15s)"
+    echo "  3) Reboot"
+    echo "  0) Exit"
+    echo "==================================================="
+}
+
+parse_selected_vms() {
+    local input=$1
+    SELECTED_VMIDS=()
+
+    if [ "$input" == "000" ]; then
+        for idx in "${!VM_MAP_INDEX_TO_ID[@]}"; do
+            SELECTED_VMIDS+=("${VM_MAP_INDEX_TO_ID[$idx]}")
+        done
+    else
+        for item in $input; do
+            if [[ -n "${VM_MAP_INDEX_TO_ID[$item]}" ]]; then
+                SELECTED_VMIDS+=("${VM_MAP_INDEX_TO_ID[$item]}")
+            elif [[ -n "${VM_MAP_ID_TO_NAME[$item]}" ]]; then
+                SELECTED_VMIDS+=("$item")
+            else
+                echo -e "${YELLOW}Warning: VM or # '$item' not found, skipping.${NC}"
+            fi
+        done
+    fi
+}
+
+execute_action() {
+    local action=$1
+    read -p "Enter list # or VMID separated by space (or 000 for all): " vm_input
+
+    if [ -z "$vm_input" ]; then
+        echo "Canceled."
+        return
+    fi
+
+    parse_selected_vms "$vm_input"
+
+    if [ ${#SELECTED_VMIDS[@]} -eq 0 ]; then
+        echo -e "${RED}No valid VM selected.${NC}"
+        read -p "Press Enter..."
+        return
+    fi
+
+    echo -e "\n${YELLOW}Selected virtual machines:${NC}"
+    for id in "${SELECTED_VMIDS[@]}"; do
+        echo " - ID: $id (${VM_MAP_ID_TO_NAME[$id]})"
+    done
+
+    read -p "Confirm execution? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Operation canceled."
+        read -p "Press Enter..."
+        return
+    fi
+
+    for id in "${SELECTED_VMIDS[@]}"; do
+        name="${VM_MAP_ID_TO_NAME[$id]}"
+        case $action in
+            start)
+                echo -e "[+] Starting VM $id ($name)..."
+                qm start "$id"
+                ;;
+            stop)
+                echo -e "[+] Stopping VM $id ($name) with 15s timeout..."
+                if ! qm shutdown "$id" --timeout 15 2>/dev/null; then
+                    echo -e "${YELLOW}[!] Soft shutdown failed. Applying forced stop (qm stop)...${NC}"
+                    qm stop "$id"
+                fi
+                ;;
+            reboot)
+                echo -e "[+] Rebooting VM $id ($name)..."
+                qm reboot "$id"
+                ;;
+        esac
+    done
+
+    read -p "Done. Press Enter to return to menu..."
+}
+
+while true; do
+    show_menu
+    read -p "Your choice [0-3]: " choice
+    case $choice in
+        1) execute_action "start" ;;
+        2) execute_action "stop" ;;
+        3) execute_action "reboot" ;;
+        0) clear; exit 0 ;;
+        *) echo "Invalid choice!"; sleep 1 ;;
+    esac
+done
+EOF
+
+# 1. Install pvesize script (RAM + Storage)
+cat << 'EOF' > /usr/local/bin/pvesize
+#!/usr/bin/env python3
+import subprocess
+
+# --- 1. RAM and Swap ---
+try:
+    with open('/proc/meminfo', 'r') as f:
+        meminfo = {}
+        for line in f:
+            parts = line.split()
+            meminfo[parts[0].rstrip(':')] = int(parts[1])
+
+    ram_total = meminfo.get('MemTotal', 0) / 1024 / 1024
+    ram_avail = meminfo.get('MemAvailable', 0) / 1024 / 1024
+    ram_used = ram_total - ram_avail
+    ram_pct = (ram_used / ram_total * 100) if ram_total > 0 else 0
+
+    swap_total = meminfo.get('SwapTotal', 0) / 1024 / 1024
+    swap_free = meminfo.get('SwapFree', 0) / 1024 / 1024
+    swap_used = swap_total - swap_free
+    swap_pct = (swap_used / swap_total * 100) if swap_total > 0 else 0
+
+    print(f"{'MEMORY':<18} {'TYPE':<12} {'TOTAL':>9} {'USED':>9} {'FREE':>9} {'USED %':>9}")
+    print("-" * 72)
+    print(f"{'RAM':<18} {'system':<12} {ram_total:>8.1f}G {ram_used:>8.1f}G {ram_avail:>8.1f}G {ram_pct:>8.1f}%")
+    if swap_total > 0:
+        print(f"{'Swap':<18} {'system':<12} {swap_total:>8.1f}G {swap_used:>8.1f}G {swap_free:>8.1f}G {swap_pct:>8.1f}%")
+    print("\n")
+except Exception as e:
+    print(f"Error fetching memory data: {e}\n")
+
+# --- 2. Proxmox Storage ---
+res = subprocess.run(["pvesm", "status"], capture_output=True, text=True)
+if res.returncode != 0:
+    print("Error fetching storage status")
+    exit(1)
+
+lines = res.stdout.strip().split("\n")
+if len(lines) >= 2:
+    print(f"{'STORAGE':<18} {'TYPE':<12} {'TOTAL':>9} {'USED':>9} {'FREE':>9} {'USED %':>9}")
+    print("-" * 72)
+
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        name = parts[0]
+        stype = parts[1]
+        status = parts[2]
+        
+        if status != "active":
+            print(f"{name:<18} {stype:<12} {'[INACTIVE]':>38}")
+            continue
+
+        total_kb = float(parts[3])
+        used_kb = float(parts[4])
+        free_kb = float(parts[5])
+        pct = float(parts[6].replace("%", "")) if parts[6] != "N/A" else 0.0
+
+        total_gb = total_kb / 1024 / 1024
+        used_gb = used_kb / 1024 / 1024
+        free_gb = free_kb / 1024 / 1024
+
+        print(f"{name:<18} {stype:<12} {total_gb:>8.1f}G {used_gb:>8.1f}G {free_gb:>8.1f}G {pct:>8.1f}%")
+EOF
+
+# 2. Install vmdisk script (Virtual Machine Disks)
+cat << 'EOF' > /usr/local/bin/vmdisk
+#!/usr/bin/env python3
+import sys, json, subprocess
+
+def check_vm(vmid):
+    try:
+        res = subprocess.run(["qm", "guest", "cmd", str(vmid), "get-fsinfo"], capture_output=True, text=True)
+        if res.returncode != 0:
+            return
+        data = json.loads(res.stdout)
+        print(f"\n=== VM {vmid} ===")
+        for fs in data:
+            mp = fs.get("mountpoint")
+            t = fs.get("total-bytes")
+            u = fs.get("used-bytes")
+            if mp and t is not None and u is not None:
+                total = t / 1073741824
+                used = u / 1073741824
+                free = (t - u) / 1073741824
+                print(f"  Disk: {mp:<10} | Total: {total:>6.1f} GB | Used: {used:>6.1f} GB | Free: {free:>6.1f} GB")
+    except Exception:
+        pass
+
+if len(sys.argv) > 1:
+    check_vm(sys.argv[1])
+else:
+    out = subprocess.run("qm list | awk '$3==\"running\" {print $1}'", shell=True, capture_output=True, text=True)
+    for vmid in out.stdout.split():
+        check_vm(vmid)
+EOF
+
+cat << 'EOF' > /usr/local/bin/pmtls
+#!/usr/bin/env bash
+
+show_menu() {
+    clear
+    echo "=================================================="
+    echo "                 PVE Tools Menu                   "
+    echo "=================================================="
+    echo "1) Virtual Machine State Control (pve)"
+    echo "2) Backup Management (backup)"
+    echo "3) Host Storage & RAM Monitoring (pvesize)"
+    echo "4) VM Disk Usage Analysis (vmdisk)"
+    echo "0) Exit"
+    echo "=================================================="
+}
+
+while true; do
+    show_menu
+    read -rp "Select an option [0-4]: " choice
+    echo ""
+    case "$choice" in
+        1)
+            /usr/local/bin/pve
+            read -rp "Press Enter to return to menu..."
+            ;;
+        2)
+            /usr/local/bin/backup
+            read -rp "Press Enter to return to menu..."
+            ;;
+        3)
+            /usr/local/bin/pvesize
+            read -rp "Press Enter to return to menu..."
+            ;;
+        4)
+            /usr/local/bin/vmdisk
+            read -rp "Press Enter to return to menu..."
+            ;;
+        0)
+            echo "Exiting."
+            exit 0
+            ;;
+        *)
+            echo "Error: Invalid option selected."
+            sleep 1
+            ;;
+    esac
+done
+EOF
+
+# Make files executable
+chmod +x /usr/local/bin/pvesize
+chmod +x /usr/local/bin/vmdisk
+chmod +x /usr/local/bin/backup
+chmod +x /usr/local/bin/pve
+chmod +x /usr/local/bin/pmtls
