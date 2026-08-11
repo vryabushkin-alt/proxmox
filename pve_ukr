@@ -1,0 +1,161 @@
+cat << 'EOF' > /usr/local/bin/pve
+#!/usr/bin/env bash
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}Помилка: Скрипт потрібно запускати від імені root.${NC}"
+   exit 1
+fi
+
+get_vms() {
+    RAW_VMS=()
+    while read -r vmid name status rest; do
+        [[ -z "$vmid" ]] && continue
+        # Фільтрація шаблонів (templates)
+        if qm config "$vmid" 2>/dev/null | grep -q "^template: 1"; then
+            continue
+        fi
+        RAW_VMS+=("$vmid|$name|$status")
+    done < <(qm list | tail -n +2)
+}
+
+show_menu() {
+    clear
+    get_vms
+
+    if [ ${#RAW_VMS[@]} -eq 0 ]; then
+        echo "Віртуальних машин не знайдено."
+        exit 0
+    fi
+
+    echo "==================================================="
+    echo "              Proxmox VE VM Manager                "
+    echo "==================================================="
+    printf "%-4s | %-22s | %-6s | %-10s\n" "№" "Назва" "VMID" "Статус"
+    echo "---------------------------------------------------"
+
+    VM_INDEX=1
+    declare -gA VM_MAP_INDEX_TO_ID
+    declare -gA VM_MAP_ID_TO_NAME
+    declare -gA VM_MAP_ID_TO_STATUS
+
+    for line in "${RAW_VMS[@]}"; do
+        vmid=$(echo "$line" | cut -d'|' -f1)
+        name=$(echo "$line" | cut -d'|' -f2)
+        status=$(echo "$line" | cut -d'|' -f3)
+
+        VM_MAP_INDEX_TO_ID[$VM_INDEX]=$vmid
+        VM_MAP_ID_TO_NAME[$vmid]=$name
+        VM_MAP_ID_TO_STATUS[$vmid]=$status
+
+        if [ "$status" == "running" ]; then
+            status_colored="${GREEN}RUNNING${NC}"
+        else
+            status_colored="${RED}STOPPED${NC}"
+        fi
+
+        printf "%-4s | %-22s | %-6s | %b\n" "$VM_INDEX" "$name" "$vmid" "$status_colored"
+        ((VM_INDEX++))
+    done
+
+    echo "---------------------------------------------------"
+    echo "Оберіть дію:"
+    echo "  1) Увімкнути (Start)"
+    echo "  2) Вимкнути (Shutdown / Force Stop 15s)"
+    echo "  3) Перезавантажити (Reboot)"
+    echo "  0) Вихід"
+    echo "==================================================="
+}
+
+parse_selected_vms() {
+    local input=$1
+    SELECTED_VMIDS=()
+
+    if [ "$input" == "000" ]; then
+        for idx in "${!VM_MAP_INDEX_TO_ID[@]}"; do
+            SELECTED_VMIDS+=("${VM_MAP_INDEX_TO_ID[$idx]}")
+        done
+    else
+        for item in $input; do
+            if [[ -n "${VM_MAP_INDEX_TO_ID[$item]}" ]]; then
+                SELECTED_VMIDS+=("${VM_MAP_INDEX_TO_ID[$item]}")
+            elif [[ -n "${VM_MAP_ID_TO_NAME[$item]}" ]]; then
+                SELECTED_VMIDS+=("$item")
+            else
+                echo -e "${YELLOW}Попередження: VM або № '$item' не знайдено, пропускаємо.${NC}"
+            fi
+        done
+    fi
+}
+
+execute_action() {
+    local action=$1
+    read -p "Введіть № списку або VMID через пробіл (або 000 для всіх): " vm_input
+
+    if [ -z "$vm_input" ]; then
+        echo "Скасовано."
+        return
+    fi
+
+    parse_selected_vms "$vm_input"
+
+    if [ ${#SELECTED_VMIDS[@]} -eq 0 ]; then
+        echo -e "${RED}Не обрано жодної дійсної VM.${NC}"
+        read -p "Натисніть Enter..."
+        return
+    fi
+
+    echo -e "\n${YELLOW}Обрані віртуальні машини:${NC}"
+    for id in "${SELECTED_VMIDS[@]}"; do
+        echo " - ID: $id (${VM_MAP_ID_TO_NAME[$id]})"
+    done
+
+    read -p "Підтверджуєте виконання? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Операцію скасовано."
+        read -p "Натисніть Enter..."
+        return
+    fi
+
+    for id in "${SELECTED_VMIDS[@]}"; do
+        name="${VM_MAP_ID_TO_NAME[$id]}"
+        case $action in
+            start)
+                echo -e "[+] Запуск VM $id ($name)..."
+                qm start "$id"
+                ;;
+            stop)
+                echo -e "[+] Зупинка VM $id ($name) з таймаутом 15 сек..."
+                if ! qm shutdown "$id" --timeout 15 2>/dev/null; then
+                    echo -e "${YELLOW}[!] М'яка зупинка не вдалася. Застосовуємо примусове вимкнення (qm stop)...${NC}"
+                    qm stop "$id"
+                fi
+                ;;
+            reboot)
+                echo -e "[+] Перезавантаження VM $id ($name)..."
+                qm reboot "$id"
+                ;;
+        esac
+    done
+
+    read -p "Готово. Натисніть Enter для повернення в меню..."
+}
+
+while true; do
+    show_menu
+    read -p "Ваш вибір [0-3]: " choice
+    case $choice in
+        1) execute_action "start" ;;
+        2) execute_action "stop" ;;
+        3) execute_action "reboot" ;;
+        0) clear; exit 0 ;;
+        *) echo "Невірний вибір!"; sleep 1 ;;
+    esac
+done
+EOF
+
+chmod +x /usr/local/bin/pve
