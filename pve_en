@@ -1,0 +1,164 @@
+cat << 'EOF' > /usr/local/bin/pve
+#!/usr/bin/env bash
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}Error: This script must be run as root.${NC}"
+   exit 1
+fi
+
+get_vms() {
+    RAW_VMS=()
+    while read -r vmid name status rest; do
+        [[ -z "$vmid" ]] && continue
+        
+        # Fast config check directly without calling `qm config`
+        conf_file="/etc/pve/qemu-server/${vmid}.conf"
+        if [[ -f "$conf_file" ]] && grep -q "^template: 1" "$conf_file"; then
+            continue
+        fi
+        
+        RAW_VMS+=("$vmid|$name|$status")
+    done < <(qm list | tail -n +2)
+}
+
+show_menu() {
+    clear
+    get_vms
+
+    if [ ${#RAW_VMS[@]} -eq 0 ]; then
+        echo "No virtual machines found."
+        exit 0
+    fi
+
+    echo "==================================================="
+    echo "              Proxmox VE VM Manager                "
+    echo "==================================================="
+    printf "%-4s | %-22s | %-6s | %-10s\n" "#" "Name" "VMID" "Status"
+    echo "---------------------------------------------------"
+
+    VM_INDEX=1
+    declare -gA VM_MAP_INDEX_TO_ID
+    declare -gA VM_MAP_ID_TO_NAME
+    declare -gA VM_MAP_ID_TO_STATUS
+
+    for line in "${RAW_VMS[@]}"; do
+        vmid=$(echo "$line" | cut -d'|' -f1)
+        name=$(echo "$line" | cut -d'|' -f2)
+        status=$(echo "$line" | cut -d'|' -f3)
+
+        VM_MAP_INDEX_TO_ID[$VM_INDEX]=$vmid
+        VM_MAP_ID_TO_NAME[$vmid]=$name
+        VM_MAP_ID_TO_STATUS[$vmid]=$status
+
+        if [ "$status" == "running" ]; then
+            status_colored="${GREEN}RUNNING${NC}"
+        else
+            status_colored="${RED}STOPPED${NC}"
+        fi
+
+        printf "%-4s | %-22s | %-6s | %b\n" "$VM_INDEX" "$name" "$vmid" "$status_colored"
+        ((VM_INDEX++))
+    done
+
+    echo "---------------------------------------------------"
+    echo "Select an action:"
+    echo "  1) Start"
+    echo "  2) Shutdown (Force Stop 15s)"
+    echo "  3) Reboot"
+    echo "  0) Exit"
+    echo "==================================================="
+}
+
+parse_selected_vms() {
+    local input=$1
+    SELECTED_VMIDS=()
+
+    if [ "$input" == "000" ]; then
+        for idx in "${!VM_MAP_INDEX_TO_ID[@]}"; do
+            SELECTED_VMIDS+=("${VM_MAP_INDEX_TO_ID[$idx]}")
+        done
+    else
+        for item in $input; do
+            if [[ -n "${VM_MAP_INDEX_TO_ID[$item]}" ]]; then
+                SELECTED_VMIDS+=("${VM_MAP_INDEX_TO_ID[$item]}")
+            elif [[ -n "${VM_MAP_ID_TO_NAME[$item]}" ]]; then
+                SELECTED_VMIDS+=("$item")
+            else
+                echo -e "${YELLOW}Warning: VM or # '$item' not found, skipping.${NC}"
+            fi
+        done
+    fi
+}
+
+execute_action() {
+    local action=$1
+    read -p "Enter list # or VMID separated by space (or 000 for all): " vm_input
+
+    if [ -z "$vm_input" ]; then
+        echo "Canceled."
+        return
+    fi
+
+    parse_selected_vms "$vm_input"
+
+    if [ ${#SELECTED_VMIDS[@]} -eq 0 ]; then
+        echo -e "${RED}No valid VM selected.${NC}"
+        read -p "Press Enter..."
+        return
+    fi
+
+    echo -e "\n${YELLOW}Selected virtual machines:${NC}"
+    for id in "${SELECTED_VMIDS[@]}"; do
+        echo " - ID: $id (${VM_MAP_ID_TO_NAME[$id]})"
+    done
+
+    read -p "Confirm execution? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Operation canceled."
+        read -p "Press Enter..."
+        return
+    fi
+
+    for id in "${SELECTED_VMIDS[@]}"; do
+        name="${VM_MAP_ID_TO_NAME[$id]}"
+        case $action in
+            start)
+                echo -e "[+] Starting VM $id ($name)..."
+                qm start "$id"
+                ;;
+            stop)
+                echo -e "[+] Stopping VM $id ($name) with 15s timeout..."
+                if ! qm shutdown "$id" --timeout 15 2>/dev/null; then
+                    echo -e "${YELLOW}[!] Soft shutdown failed. Applying forced stop (qm stop)...${NC}"
+                    qm stop "$id"
+                fi
+                ;;
+            reboot)
+                echo -e "[+] Rebooting VM $id ($name)..."
+                qm reboot "$id"
+                ;;
+        esac
+    done
+
+    read -p "Done. Press Enter to return to menu..."
+}
+
+while true; do
+    show_menu
+    read -p "Your choice [0-3]: " choice
+    case $choice in
+        1) execute_action "start" ;;
+        2) execute_action "stop" ;;
+        3) execute_action "reboot" ;;
+        0) clear; exit 0 ;;
+        *) echo "Invalid choice!"; sleep 1 ;;
+    esac
+done
+EOF
+
+chmod +x /usr/local/bin/pve
