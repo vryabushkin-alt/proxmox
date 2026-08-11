@@ -15,10 +15,13 @@ get_vms() {
     RAW_VMS=()
     while read -r vmid name status rest; do
         [[ -z "$vmid" ]] && continue
-        # Фільтрація шаблонів (templates)
-        if qm config "$vmid" 2>/dev/null | grep -q "^template: 1"; then
+        
+        # Швидка перевірка конфігу напряму без виклика `qm config`
+        conf_file="/etc/pve/qemu-server/${vmid}.conf"
+        if [[ -f "$conf_file" ]] && grep -q "^template: 1" "$conf_file"; then
             continue
         fi
+        
         RAW_VMS+=("$vmid|$name|$status")
     done < <(qm list | tail -n +2)
 }
