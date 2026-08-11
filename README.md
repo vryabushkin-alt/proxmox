@@ -2,4 +2,6 @@ curl -sSL https://raw.githubusercontent.com/vryabushkin-alt/proxmox/refs/heads/m
 
 curl -sSL https://raw.githubusercontent.com/vryabushkin-alt/proxmox/refs/heads/main/backup | bash
 
+curl -sSL https://raw.githubusercontent.com/vryabushkin-alt/proxmox/refs/heads/main/pve_ukr | bash
+
 curl -sSL https://raw.githubusercontent.com/vryabushkin-alt/proxmox/refs/heads/main/backup | sudo bash
